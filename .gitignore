@@ -48,3 +48,6 @@ cl/settings/google_auth.json
 
 .vscode/*
 /.history
+
+#Ignore GitHub Copilot instructions file
+.github/copilot-instructions.md
