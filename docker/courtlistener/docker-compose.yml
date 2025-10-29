@@ -103,7 +103,10 @@ services:
       dockerfile: "./docker/django/Dockerfile"
       args:
         BUILD_ENV: dev
-    command: web-dev
+    # To enable VS Code debugging, change the command below to:
+    # command: web-dev-debug
+    # This will start Django with debugpy enabled on port 5678.
+    command: web-dev-debug
     depends_on:
       - cl-postgresql
       - cl-redis
@@ -114,6 +117,8 @@ services:
       - cl-es
     ports:
       - "8000:8000"
+      # Uncomment the line below for debug mode
+      - "5678:5678"      
     user: root
     volumes:
       - ${CL_POSTGRES_RUN_DIR:-/var/run/postgresql}:/var/run/postgresql

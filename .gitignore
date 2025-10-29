@@ -51,3 +51,6 @@ cl/settings/google_auth.json
 
 #Ignore GitHub Copilot instructions file
 .github/copilot-instructions.md
+
+#Ignore build output directories
+build/

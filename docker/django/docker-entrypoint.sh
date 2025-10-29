@@ -18,6 +18,12 @@ case "$1" in
     ./manage.py createcachetable
     exec ./manage.py runserver 0.0.0.0:8000
     ;;
+'web-dev-debug')
+    echo ">>> Running web-dev-debug entrypoint"
+    ./manage.py migrate
+    ./manage.py createcachetable
+    exec python -m debugpy --listen 0.0.0.0:5678 manage.py runserver 0.0.0.0:8000
+    ;;
 'web-prod')
     # Tips:
     # 1. Set high number of --workers. Docs recommend 2-4× core count
