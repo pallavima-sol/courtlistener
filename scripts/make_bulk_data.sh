@@ -6,12 +6,19 @@ echo "Installing utilities"
 # Make sure the sudo package is installed
 apt-get update && apt-get install -y sudo
 
-# Set up Sentry
-curl -sL https://sentry.io/get-cli/ | bash
-eval "$(sentry-cli bash-hook)"
+
+DISABLE_SENTRY=true
+echo $DISABLE_SENTRY
+
+if [[ "$DISABLE_SENTRY" != "true" ]]; then
+	# Set up Sentry
+	curl -sL https://sentry.io/get-cli/ | bash
+	eval "$(sentry-cli bash-hook)"
+fi
+
 
 # Set up AWS tools and gnupg (needed for apt-key add, below)
-apt install -y awscli gnupg
+#apt install -y awscli gnupg
 
 # Install latest version of pg_dump (else we get an error about version mismatch
 install -d /etc/apt/keyrings
@@ -28,6 +35,17 @@ apt-get install -y postgresql-client-17
 
 # We only need to set PGPASSWORD once
 export PGPASSWORD=$DB_PASSWORD
+
+# Function to qualify a field list with a table alias
+# Usage: qualify_fields "$fields_var" "alias"
+qualify_fields() {
+    local fields="$1"
+    local alias="$2"
+    echo "$fields" | tr -d '()\n' | awk -v a="$alias" -F, '{for(i=1;i<=NF;i++){gsub(/^ +| +$/,"",$i); printf a"."$i (i<NF?", ":"")}}'
+}
+
+# court id to filter scotus related data
+export_for_court_id="scotus"
 
 # search_court
 court_fields='(
@@ -64,6 +82,9 @@ docket_fields='(id, date_created, date_modified, source, appeal_from_str,
 	       federal_dn_judge_initials_referred, federal_defendant_number, parent_docket_id
 	       )'
 dockets_csv_filename="dockets-$(date -I).csv"
+dockets_fields_select=$(qualify_fields "$docket_fields" "d")
+dockets_query="SELECT $dockets_fields_select FROM search_docket d WHERE d.court_id = '$export_for_court_id'"
+
 
 # search_originatingcourtinformation
 originatingcourtinformation_fields='(
@@ -116,6 +137,8 @@ opinion_fields='(
 	       html_with_citations, extracted_by_ocr, author_id, cluster_id
 	   )'
 opinions_csv_filename="opinions-$(date -I).csv"
+opinion_fields_select=$(qualify_fields "$opinion_fields" "o")
+opinion_query="SELECT $opinion_fields_select FROM search_opinion o JOIN search_opinioncluster c ON o.cluster_id = c.id JOIN search_docket d ON c.docket_id = d.id WHERE d.court_id = '$export_for_court_id'"
 
 # search_opinionscited
 opinionscited_fields='(
@@ -302,12 +325,12 @@ declare -a t_5=("people_db_position" "$people_db_position_fields" "$people_db_po
 declare -a t_6=("recap_fjcintegrateddatabase" "$fjcintegrateddatabase_fields" "$fjcintegrateddatabase_csv_filename")
 declare -a t_7=("search_originatingcourtinformation" "$originatingcourtinformation_fields" "$originatingcourtinformation_csv_filename")
 
-declare -a t_8=("search_docket" "$docket_fields" "$dockets_csv_filename")
+declare -a t_8=("search_docket" "$docket_fields" "$dockets_csv_filename" "query" "$dockets_query")
 declare -a t_9=("search_opinioncluster" "$opinioncluster_fields" "$opinioncluster_csv_filename")
 declare -a t_10=("search_opinioncluster_panel" "$search_opinioncluster_panel_fields" "$search_opinioncluster_panel_csv_filename")
 declare -a t_11=("search_opinioncluster_non_participating_judges" "$search_opinioncluster_non_participating_judges_fields" "$search_opinioncluster_non_participating_judges_csv_filename")
 
-declare -a t_12=("search_opinion" "$opinion_fields" "$opinions_csv_filename")
+declare -a t_12=("search_opinion" "$opinion_fields" "$opinions_csv_filename" "query" "$opinion_query")
 declare -a t_13=("search_opinion_joined_by" "$search_opinion_joined_by_fields" "$search_opinion_joined_by_csv_filename")
 declare -a t_14=("search_courthouse" "$courthouse_fields" "$courthouse_csv_filename")
 declare -a t_15=("search_court_appeals_to" "$court_appeals_to_fields" "$court_appeals_to_csv_filename")
@@ -341,16 +364,34 @@ done
 for group in "${listOfLists[@]}"; do
 declare -a lst="$group"
 echo "Streaming ${lst[0]} to S3"
-psql \
-	--command \
-	  "set statement_timeout to 0;
-	   COPY ${lst[0]} ${lst[1]} TO STDOUT WITH (FORMAT csv, ENCODING utf8, HEADER, ESCAPE '\\', FORCE_QUOTE *)" \
-	--quiet \
-	--host "$DB_HOST" \
-	--username "$DB_USER" \
-	--dbname courtlistener | \
-	bzip2 | \
-	aws s3 cp - s3://com-courtlistener-storage/bulk-data/"${lst[2]}".bz2 --acl public-read
+
+	psql \
+		--command \
+		"set statement_timeout to 0;
+		COPY ${lst[0]} ${lst[1]} TO STDOUT WITH (FORMAT csv, ENCODING utf8, HEADER, ESCAPE '\\', FORCE_QUOTE *)" \
+		--quiet \
+		--host "$DB_HOST" \
+		--username "$DB_USER" \
+		--dbname courtlistener | \
+		bzip2 > "./${lst[2]}".bz2
+		#bzip2 | \
+		#aws s3 cp - s3://com-courtlistener-storage/bulk-data/"${lst[2]}".bz2 --acl public-read
+
+	#if a query is specified, use that to export data to a court specific file
+	if [[ ${#lst[@]} -ge 5 && "${lst[4]}" == "query" ]]; then
+		psql \
+			--command \
+				"set statement_timeout to 0;
+				COPY (${lst[3]}) TO STDOUT WITH (FORMAT csv, ENCODING utf8, HEADER, ESCAPE '\\', FORCE_QUOTE *)" \
+			--quiet \
+			--host "$DB_HOST" \
+			--username "$DB_USER" \
+			--dbname courtlistener | \
+			bzip2 > "./${export_for_court_id}-${lst[2]}".bz2
+			#bzip2 | \
+			#aws s3 cp - s3://com-courtlistener-storage/bulk-data/"${export_for_court_id}-${lst[2]}".bz2 --acl public-read
+
+
 done
 
 echo "Exporting schema to S3"
@@ -368,7 +409,8 @@ pg_dump \
     --no-privileges \
     --no-publications \
     --no-subscriptions courtlistener | \
-	aws s3 cp - s3://com-courtlistener-storage/bulk-data/"$schema_filename" --acl public-read
+	tee ./$schema_filename
+	#aws s3 cp - s3://com-courtlistener-storage/bulk-data/"$schema_filename" --acl public-read
 
 echo "Generating and streaming load bulk data script to S3"
 BULK_SCRIPT_FILENAME="load-bulk-data-$(date -I).sh"
@@ -379,12 +421,15 @@ cat > "$OUT" <<- EOF
 #!/bin/bash
 set -e
 # You must place all uncompressed bulk files in the same directory and set
-# environment variable BULK_DIR, BULK_DB_HOST, BULK_DB_USER, BULK_DB_PASSWORD
+# environment variable BULK_DIR, BULK_DB_HOST, BULK_DB_USER, BULK_DB_PASSWORD, IMPORT_COURT_SPECIFIC_DATA
 # NOTES:
 # 1. If you have your postgresql instance on a docker service, you need to mount
 # the directory where the bulk files are, otherwise you will get this error:
+#    To import court specific data, set the variable IMPORT_COURT_SPECIFIC_DATA to 'yes' 
 # ERROR:  could not open file No such file or directory
 # 2. You may need to grant execute permissions to this file
+
+
 
 if [[ -z \${BULK_DIR} ]];
 then
@@ -423,9 +468,16 @@ EOF
 for group in "${listOfLists[@]}"; do
 declare -a lst="$group"
 cat >> "$OUT" <<- EOF
-echo "Loading ${lst[2]} to database"
+
+import_file="\$BULK_DIR/${lst[2]}"
+if [[ "\$IMPORT_COURT_SPECIFIC_DATA" == "yes" && -n "\$export_for_court_id" && -f "\$BULK_DIR/\${export_for_court_id}-\${lst[2]}" ]]; then
+    import_file="\$BULK_DIR/\${export_for_court_id}-\${lst[2]}"
+fi
+
+
+echo "Loading ${import_file} to database"
 psql --command \
-"\COPY public.${lst[0]} ${lst[1]} FROM '\$BULK_DIR/${lst[2]}' WITH (FORMAT csv, ENCODING utf8, ESCAPE '\\', HEADER)" \
+"\COPY public.${lst[0]} ${lst[1]} FROM '\$import_file' WITH (FORMAT csv, ENCODING utf8, ESCAPE '\\', HEADER)" \
 --host "\$BULK_DB_HOST" \
 --username "\$BULK_DB_USER" \
 --dbname "\$BULK_DB_NAME"
@@ -434,7 +486,8 @@ EOF
 done
 
 # Upload generated file to S3
-aws s3 cp "$OUT" s3://com-courtlistener-storage/bulk-data/"$BULK_SCRIPT_FILENAME" --acl public-read
+#aws s3 cp "$OUT" s3://com-courtlistener-storage/bulk-data/"$BULK_SCRIPT_FILENAME" --acl public-read
+mv "$OUT" "./$BULK_SCRIPT_FILENAME"
 
 # Remove the temp file when script ends to execute
 trap "rm -f $OUT" EXIT
